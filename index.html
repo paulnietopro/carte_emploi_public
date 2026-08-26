@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Carte des offres — Emploi public (outil non officiel)</title>
+<meta name="description" content="Carte interactive des offres d'emploi du service public par rayon de recherche, à partir des données ouvertes de la DGAFP.">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
+<link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css">
+<link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div id="app">
+  <header>
+    <h1>🗺️ Carte des offres — Service public</h1>
+    <span class="subtitle">Outil indépendant, non affilié à l'État — données ouvertes DGAFP / data.gouv.fr</span>
+  </header>
+
+  <div id="first-run-banner" style="display:none; background:#fff4e5; color:#7a4b00; padding:8px 18px; font-size:0.82rem; border-bottom:1px solid #f0d9a8;">
+    ⚠️ Aucune offre importée pour l'instant. Ouvrez l'onglet <strong>Actions</strong> du dépôt GitHub et lancez manuellement le workflow « Mise à jour des offres » (bouton <em>Run workflow</em>), ou patientez jusqu'au prochain run automatique (toutes les 12h).
+  </div>
+
+  <div class="controls">
+    <div class="control-group grow search-wrap">
+      <label for="address-input">Centre de recherche (adresse, ville...)</label>
+      <input type="text" id="address-input" placeholder="Ex : Toulouse, ou 12 rue de la Paix Paris" autocomplete="off">
+      <div id="autocomplete-list"></div>
+    </div>
+
+    <div class="control-group">
+      <label>&nbsp;</label>
+      <button id="geoloc-btn" title="Utiliser ma position actuelle">📍 Ma position</button>
+    </div>
+
+    <div class="control-group" style="min-width:220px;">
+      <label for="radius-input">Rayon de recherche</label>
+      <div class="radius-row">
+        <input type="range" id="radius-input" min="1" max="200" value="25" step="1">
+        <span class="radius-value" id="radius-value">25 km</span>
+      </div>
+    </div>
+
+    <div class="control-group">
+      <label for="domain-filter">Domaine</label>
+      <select id="domain-filter"><option value="">Tous</option></select>
+    </div>
+
+    <div class="control-group">
+      <label for="contract-filter">Type de contrat</label>
+      <select id="contract-filter"><option value="">Tous</option></select>
+    </div>
+
+    <div class="control-group grow">
+      <label for="keyword-input">Mot-clé (titre / employeur)</label>
+      <input type="text" id="keyword-input" placeholder="Ex : infirmier, informatique...">
+    </div>
+  </div>
+
+  <main>
+    <div id="map"></div>
+    <div id="sidebar">
+      <div id="sidebar-header">
+        <strong id="results-count">0</strong> offre(s) trouvée(s) dans le rayon sélectionné
+      </div>
+      <div id="results-list">
+        <div id="empty-state">Choisissez un centre de recherche (adresse ou position actuelle) pour afficher les offres à proximité.</div>
+      </div>
+    </div>
+  </main>
+
+  <footer>
+    <span>Source des données : <a href="https://www.data.gouv.fr/datasets/les-offres-diffusees-sur-choisir-le-service-public" target="_blank" rel="noopener">DGAFP — data.gouv.fr</a>, licence ouverte. Rafraîchissement automatique ~toutes les 12h. Géocodage : <a href="https://adresse.data.gouv.fr/" target="_blank" rel="noopener">Base Adresse Nationale</a>.</span>
+    <span id="last-update">Dernière mise à jour des données : —</span>
+  </footer>
+</div>
+
+<button id="sidebar-toggle" style="display:none; position:fixed; bottom:16px; right:16px; z-index:20; border-radius:50%; width:48px; height:48px;">☰</button>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+<script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
+<script src="assets/app.js"></script>
+</body>
+</html>
