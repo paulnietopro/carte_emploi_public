@@ -62,6 +62,12 @@ MAX_GEOCODE_PER_RUN = int(os.environ.get("MAX_GEOCODE_PER_RUN", "4000"))
 HTTP_TIMEOUT = 30
 USER_AGENT = "carte-emploi-public/1.0 (github actions data refresh script)"
 
+# Score de confiance minimum (0 à 1) renvoyé par l'API Adresse pour accepter
+# un géocodage. En dessous, l'offre est considérée non localisable plutôt que
+# risquer un placement trompeur sur la carte (ex : texte de localisation vague
+# comme un nom de zone/bassin administratif). Ajustable si trop strict/laxiste.
+MIN_BAN_SCORE = float(os.environ.get("MIN_BAN_SCORE", "0.45"))
+
 # ---------------------------------------------------------------------------
 # Correspondance colonne logique -> fragments de noms possibles dans le CSV
 # (comparaison faite sur des noms de colonnes normalisés : minuscules, sans
@@ -277,9 +283,20 @@ def geocode_key(location_text: str) -> str:
     return re.sub(r"\s+", " ", location_text.strip().lower())
 
 
-def geocode_ban(location_text: str) -> tuple[float, float] | None:
+def geocode_ban(location_text: str) -> tuple[float, float, float] | None:
     """Interroge l'API Adresse (Base Adresse Nationale), gratuite et sans clé,
-    avec le texte de localisation tel quel (recherche libre)."""
+    avec le texte de localisation tel quel (recherche libre). Renvoie
+    (lat, lon, score) — le score (0 à 1) est conservé dans le cache pour
+    pouvoir re-filtrer plus tard sans refaire d'appel réseau si le seuil
+    MIN_BAN_SCORE change.
+
+    Un texte de localisation vague (ex : nom d'une zone/bassin administratif
+    de l'Éducation nationale plutôt qu'une ville ou une adresse précise) peut
+    renvoyer un résultat "le plus proche possible" mais peu fiable — sans ce
+    filtre, une offre pouvait se retrouver géolocalisée à des dizaines de km
+    de son vrai lieu d'affectation (cas constaté : Mont-de-Marsan -> Pauillac).
+    On rejette donc tout résultat sous MIN_BAN_SCORE plutôt que d'afficher un
+    point trompeur sur la carte."""
     try:
         resp = requests.get(
             BAN_SEARCH_URL,
@@ -293,8 +310,12 @@ def geocode_ban(location_text: str) -> tuple[float, float] | None:
         features = payload.get("features") or []
         if not features:
             return None
-        lon, lat = features[0]["geometry"]["coordinates"]
-        return float(lat), float(lon)
+        best = features[0]
+        score = float((best.get("properties") or {}).get("score") or 0.0)
+        if score < MIN_BAN_SCORE:
+            return None
+        lon, lat = best["geometry"]["coordinates"]
+        return float(lat), float(lon), score
     except Exception:  # noqa: BLE001
         return None
 
@@ -323,7 +344,13 @@ def enrich_with_coordinates(records: list[dict], mapping: dict[str, str]) -> lis
             r["_lat"], r["_lon"] = coords
 
     # 3) Pour le reste, géocoder le texte de localisation, avec cache + limite par run.
+    # Les entrées de cache d'un ancien format (sans score, [lat, lon] à 2
+    # éléments) sont considérées à re-vérifier : elles ont pu être acceptées
+    # avant l'introduction du filtre MIN_BAN_SCORE et être en réalité peu
+    # fiables (cf. cas Mont-de-Marsan -> Pauillac). Un résultat déjà rejeté
+    # (None) n'a pas besoin d'être retenté.
     to_geocode: dict[str, str] = {}
+    stale_cache_entries = 0
     for r in records:
         if r["_lat"] is not None:
             continue
@@ -332,9 +359,14 @@ def enrich_with_coordinates(records: list[dict], mapping: dict[str, str]) -> lis
             continue
         key = geocode_key(loc)
         if key in cache:
-            continue
+            cached_val = cache[key]
+            if cached_val is None or len(cached_val) >= 3:
+                continue  # déjà résolu (avec score vérifié) ou déjà connu comme non-géocodable
+            stale_cache_entries += 1
         to_geocode.setdefault(key, loc)
 
+    if stale_cache_entries:
+        print(f"[info] {stale_cache_entries} entrées de cache d'un ancien format (sans score) seront re-géocodées pour vérification.")
     print(f"[info] Nouvelles localisations à géocoder : {len(to_geocode)} (plafond ce run : {MAX_GEOCODE_PER_RUN}).")
 
     geocoded_this_run = 0
@@ -345,8 +377,9 @@ def enrich_with_coordinates(records: list[dict], mapping: dict[str, str]) -> lis
         result = geocode_ban(loc)
         cache[key] = list(result) if result else None
         geocoded_this_run += 1
-        if geocoded_this_run % 500 == 0:
-            print(f"[info] ... {geocoded_this_run} localisations géocodées jusqu'ici.")
+        if geocoded_this_run % 200 == 0:
+            save_json(GEOCODE_CACHE_PATH, cache)  # sauvegarde incrémentale : rien n'est perdu si le run est interrompu
+            print(f"[info] ... {geocoded_this_run} localisations géocodées jusqu'ici (cache sauvegardé).")
         time.sleep(0.08)  # reste largement sous la limite de l'API BAN
 
     save_json(GEOCODE_CACHE_PATH, cache)
