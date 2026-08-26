@@ -13,13 +13,23 @@ dans COLUMN_ALIASES ci-dessous. Si le script échoue avec une erreur du type
 affichée dans le log (imprimée systématiquement au démarrage) et de compléter
 la liste d'alias correspondante.
 
+Particularité de ce jeu de données (constaté le 2026-08-26 sur un run réel) :
+il ne contient NI colonne "URL de l'offre" NI colonnes ville/code postal
+séparées. La localisation se déduit d'un des 3 champs texte libres
+("Lieu d'affectation", "Lieu d'affectation (sans géolocalisation)",
+"Localisation du poste", utilisés dans cet ordre de priorité par ligne) que
+l'on géocode via l'API Adresse. Faute d'URL directe, un lien de recherche
+Google (site:choisirleservicepublic.gouv.fr) est construit à la place — voir
+build_fallback_search_url().
+
 Usage:
     python scripts/update_data.py
 
 Variables d'environnement optionnelles:
     MAX_GEOCODE_PER_RUN   nombre max de nouvelles adresses géocodées par run
-                           (défaut 2000, pour ne pas taper trop fort sur l'API
-                           BAN lors du tout premier run)
+                           (défaut 4000 ; le premier run peut ne pas tout
+                           géocoder d'un coup, le reste se rattrape aux runs
+                           suivants grâce au cache)
 """
 from __future__ import annotations
 
@@ -30,6 +40,7 @@ import re
 import sys
 import time
 import unicodedata
+import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -41,14 +52,13 @@ DATA_DIR = ROOT / "data"
 OFFERS_OUT = DATA_DIR / "offres.json"
 LAST_UPDATE_OUT = DATA_DIR / "last_update.json"
 GEOCODE_CACHE_PATH = DATA_DIR / "geocode_cache.json"
-UNMATCHED_LOG_PATH = DATA_DIR / "geocode_unresolved.json"
 
 DATASET_SLUG = "les-offres-diffusees-sur-choisir-le-service-public"
 DATASET_API_URL = f"https://www.data.gouv.fr/api/1/datasets/{DATASET_SLUG}/"
 
 BAN_SEARCH_URL = "https://api-adresse.data.gouv.fr/search/"
 
-MAX_GEOCODE_PER_RUN = int(os.environ.get("MAX_GEOCODE_PER_RUN", "2000"))
+MAX_GEOCODE_PER_RUN = int(os.environ.get("MAX_GEOCODE_PER_RUN", "4000"))
 HTTP_TIMEOUT = 30
 USER_AGENT = "carte-emploi-public/1.0 (github actions data refresh script)"
 
@@ -60,25 +70,45 @@ USER_AGENT = "carte-emploi-public/1.0 (github actions data refresh script)"
 # ---------------------------------------------------------------------------
 COLUMN_ALIASES: dict[str, list[str]] = {
     "id": ["id_offre", "reference_offre", "numero_offre", "reference", "id"],
-    "title": ["intitule_du_poste", "intitule_offre", "intitule_du_poste", "intitule", "titre_offre", "titre"],
-    "employer": ["nom_employeur", "employeur", "libelle_employeur", "etablissement", "organisme"],
-    "city": ["ville", "commune", "lieu_travail_libelle", "lieu_de_travail", "libelle_lieu_travail", "localisation"],
-    "postal_code": ["code_postal_lieu_travail", "code_postal", "cp_lieu_travail", "cp"],
-    "department": ["departement_lieu_travail", "code_departement", "departement"],
-    "region": ["region_lieu_travail", "region"],
-    "domain": ["domaine_metier", "famille_metier", "domaine"],
-    "contract_type": ["nature_contrat", "type_contrat", "categorie_contrat", "contrat"],
+    "title": ["intitule_du_poste", "intitule_offre", "intitule", "titre_offre", "titre"],
+    "employer": ["nom_employeur", "employeur", "libelle_employeur", "etablissement", "organisme_de_rattachement", "organisme"],
+    "domain": ["domaine_metier", "famille_metier", "domaine", "metier"],
+    "contract_type": ["nature_de_contrat", "nature_contrat", "type_contrat", "categorie_contrat", "duree_du_contrat", "contrat"],
     "versant": ["versant", "type_employeur", "fonction_publique"],
-    "publish_date": ["date_publication", "date_creation", "date_de_publication", "date_debut_publication"],
-    "closing_date": ["date_limite_candidature", "date_cloture", "date_fin_publication", "date_limite"],
+    "publish_date": ["date_de_premiere_publication", "date_de_debut_de_publication", "date_publication", "date_creation"],
+    "closing_date": ["date_de_fin_de_publication", "date_limite_candidature", "date_cloture", "date_limite"],
     "url": ["url_offre", "lien_offre", "url", "lien"],
     "lat": ["latitude", "lat"],
     "lon": ["longitude", "lng", "lon"],
+    # Champs "ville"/"code_postal" gardés en fallback pour d'anciennes variantes
+    # du CSV qui les exposeraient sous cette forme classique (voir aussi
+    # LOCATION_COLUMN_CANDIDATES ci-dessous pour le format constaté en 2026).
+    "city": ["ville", "commune", "lieu_travail_libelle", "lieu_de_travail", "libelle_lieu_travail"],
+    "postal_code": ["code_postal_lieu_travail", "code_postal", "cp_lieu_travail", "cp"],
+    "department": ["departement_lieu_travail", "code_departement", "departement"],
+    "region": ["region_lieu_travail", "region"],
 }
 
-REQUIRED_LOGICAL_FIELDS = ["title", "url"]
-# On a besoin d'AU MOINS une des deux façons de localiser une offre :
-# soit des coordonnées déjà présentes, soit ville/code postal à géocoder.
+REQUIRED_LOGICAL_FIELDS = ["title"]
+
+# Colonnes texte libre décrivant la localisation, par ordre de priorité
+# (on prend la première non vide, ligne par ligne). Comparaison en égalité
+# stricte sur le nom normalisé (pas de "contains") car ces noms se chevauchent
+# ("lieu_d_affectation" est un préfixe de "lieu_d_affectation_sans_...").
+LOCATION_COLUMN_CANDIDATES = [
+    "lieu_d_affectation",
+    "lieu_d_affectation_sans_geolocalisation",
+    "localisation_du_poste",
+]
+
+# Tentative d'extraction de coordonnées directement présentes dans un champ
+# texte (au cas où "Lieu d'affectation" embarquerait un WKT ou un couple
+# lat/lon). Bornes approximatives de la France métropolitaine + DROM larges
+# pour éviter de confondre avec un code postal ou une référence.
+COORD_PATTERNS = [
+    re.compile(r"POINT\s*\(\s*(-?\d{1,3}\.\d+)\s+(-?\d{1,3}\.\d+)\s*\)", re.IGNORECASE),  # WKT: lon lat
+    re.compile(r"(-?\d{1,2}\.\d{3,})\s*[,;]\s*(-?\d{1,2}\.\d{3,})"),  # "lat,lon" ou "lon,lat" généreux
+]
 
 
 def normalize_colname(name: str) -> str:
@@ -156,7 +186,9 @@ def download_csv(url: str) -> pd.DataFrame:
     raise RuntimeError(f"Impossible de parser le CSV avec les combinaisons connues. Dernière erreur : {last_error}")
 
 
-def map_columns(df: pd.DataFrame) -> dict[str, str]:
+def map_columns(df: pd.DataFrame) -> tuple[dict[str, str], list[str]]:
+    """Renvoie (mapping colonne logique -> colonne CSV, liste ordonnée des
+    colonnes de localisation texte libre réellement présentes)."""
     normalized_to_original = {normalize_colname(c): c for c in df.columns}
     print("[info] Colonnes détectées dans le CSV source :")
     for norm, orig in normalized_to_original.items():
@@ -175,9 +207,20 @@ def map_columns(df: pd.DataFrame) -> dict[str, str]:
         if found:
             mapping[logical] = found
 
+    location_columns = [
+        normalized_to_original[cand] for cand in LOCATION_COLUMN_CANDIDATES if cand in normalized_to_original
+    ]
+
     print("[info] Correspondance colonne logique -> colonne CSV :")
     for logical in COLUMN_ALIASES:
         print(f"       {logical:15s} -> {mapping.get(logical)}")
+    print(f"[info] Colonnes de localisation (texte libre, par priorité) : {location_columns}")
+
+    # Petit échantillon de valeurs brutes pour les colonnes de localisation,
+    # utile pour diagnostiquer le format exact si le géocodage échoue en masse.
+    if location_columns:
+        sample = df[location_columns].head(3).to_dict(orient="records")
+        print(f"[info] Échantillon de valeurs de localisation (3 premières lignes) : {sample}")
 
     missing_required = [f for f in REQUIRED_LOGICAL_FIELDS if f not in mapping]
     if missing_required:
@@ -190,14 +233,15 @@ def map_columns(df: pd.DataFrame) -> dict[str, str]:
 
     has_latlon = "lat" in mapping and "lon" in mapping
     has_city_or_cp = "city" in mapping or "postal_code" in mapping
-    if not has_latlon and not has_city_or_cp:
+    if not has_latlon and not has_city_or_cp and not location_columns:
         raise RuntimeError(
-            "Ni coordonnées GPS ni ville/code postal trouvées dans le CSV : "
-            "impossible de placer les offres sur la carte. Voir la liste des "
-            "colonnes ci-dessus et mettre à jour COLUMN_ALIASES."
+            "Ni coordonnées GPS, ni ville/code postal, ni champ de localisation "
+            "texte libre trouvés dans le CSV : impossible de placer les offres "
+            "sur la carte. Voir la liste des colonnes ci-dessus et mettre à jour "
+            "COLUMN_ALIASES / LOCATION_COLUMN_CANDIDATES."
         )
 
-    return mapping
+    return mapping, location_columns
 
 
 def load_json(path: Path, default):
@@ -214,24 +258,35 @@ def save_json(path: Path, obj) -> None:
     path.write_text(json.dumps(obj, ensure_ascii=False, indent=None, separators=(",", ":")), encoding="utf-8")
 
 
-def geocode_key(city: str | None, postal_code: str | None) -> str:
-    city = (city or "").strip()
-    postal_code = (postal_code or "").strip()
-    return f"{postal_code}|{city}".lower()
+def extract_coords_from_text(text: str | None) -> tuple[float, float] | None:
+    if not text:
+        return None
+    for pattern in COORD_PATTERNS:
+        m = pattern.search(text)
+        if not m:
+            continue
+        a, b = float(m.group(1)), float(m.group(2))
+        # Devine l'ordre (lat, lon) à partir des bornes plausibles pour la France.
+        for lat, lon in ((a, b), (b, a)):
+            if 40 <= lat <= 52 and -6 <= lon <= 10:
+                return lat, lon
+    return None
 
 
-def geocode_ban(city: str, postal_code: str) -> tuple[float, float] | None:
-    """Interroge l'API Adresse (Base Adresse Nationale), gratuite et sans clé."""
-    params = {"limit": 1}
-    query_parts = [p for p in [city] if p]
-    if not query_parts:
-        query_parts = [postal_code]
-    params["q"] = " ".join(query_parts)
-    if postal_code:
-        params["postcode"] = postal_code
+def geocode_key(location_text: str) -> str:
+    return re.sub(r"\s+", " ", location_text.strip().lower())
 
+
+def geocode_ban(location_text: str) -> tuple[float, float] | None:
+    """Interroge l'API Adresse (Base Adresse Nationale), gratuite et sans clé,
+    avec le texte de localisation tel quel (recherche libre)."""
     try:
-        resp = requests.get(BAN_SEARCH_URL, params=params, headers={"User-Agent": USER_AGENT}, timeout=HTTP_TIMEOUT)
+        resp = requests.get(
+            BAN_SEARCH_URL,
+            params={"q": location_text, "limit": 1},
+            headers={"User-Agent": USER_AGENT},
+            timeout=HTTP_TIMEOUT,
+        )
         if resp.status_code != 200:
             return None
         payload = resp.json()
@@ -250,8 +305,10 @@ def enrich_with_coordinates(records: list[dict], mapping: dict[str, str]) -> lis
 
     has_direct_latlon = "lat" in mapping and "lon" in mapping
 
-    # 1) Utiliser les coordonnées directes du CSV quand elles existent et sont valides.
+    # 1) Coordonnées directes du CSV si présentes et valides.
+    # 2) Sinon, coordonnées embarquées dans le texte de localisation (WKT etc.).
     for r in records:
+        r["_lat"], r["_lon"] = None, None
         if has_direct_latlon:
             try:
                 lat = float(str(r.get("lat")).replace(",", "."))
@@ -261,49 +318,54 @@ def enrich_with_coordinates(records: list[dict], mapping: dict[str, str]) -> lis
                     continue
             except (TypeError, ValueError):
                 pass
-        r["_lat"], r["_lon"] = None, None
+        coords = extract_coords_from_text(r.get("location_text"))
+        if coords:
+            r["_lat"], r["_lon"] = coords
 
-    # 2) Pour le reste, géocoder par (ville, code postal), avec cache + limite par run.
-    to_geocode_keys: dict[str, tuple[str, str]] = {}
+    # 3) Pour le reste, géocoder le texte de localisation, avec cache + limite par run.
+    to_geocode: dict[str, str] = {}
     for r in records:
         if r["_lat"] is not None:
             continue
-        key = geocode_key(r.get("city"), r.get("postal_code"))
-        if key == "|":
+        loc = (r.get("location_text") or "").strip()
+        if not loc:
             continue
+        key = geocode_key(loc)
         if key in cache:
             continue
-        to_geocode_keys.setdefault(key, (r.get("city") or "", r.get("postal_code") or ""))
+        to_geocode.setdefault(key, loc)
 
-    print(f"[info] Nouvelles localisations à géocoder : {len(to_geocode_keys)} (plafond ce run : {MAX_GEOCODE_PER_RUN}).")
+    print(f"[info] Nouvelles localisations à géocoder : {len(to_geocode)} (plafond ce run : {MAX_GEOCODE_PER_RUN}).")
 
     geocoded_this_run = 0
-    for key, (city, cp) in to_geocode_keys.items():
+    for key, loc in to_geocode.items():
         if geocoded_this_run >= MAX_GEOCODE_PER_RUN:
             print("[warn] Plafond de géocodage atteint pour ce run, le reste sera traité au prochain run planifié.")
             break
-        result = geocode_ban(city, cp)
+        result = geocode_ban(loc)
         cache[key] = list(result) if result else None
         geocoded_this_run += 1
+        if geocoded_this_run % 500 == 0:
+            print(f"[info] ... {geocoded_this_run} localisations géocodées jusqu'ici.")
         time.sleep(0.08)  # reste largement sous la limite de l'API BAN
 
     save_json(GEOCODE_CACHE_PATH, cache)
     print(f"[info] {geocoded_this_run} nouvelles adresses géocodées ce run. Cache total : {len(cache)}.")
 
-    # 3) Appliquer le cache aux enregistrements restants.
+    # 4) Appliquer le cache aux enregistrements restants.
     unresolved = 0
     for r in records:
         if r["_lat"] is not None:
             continue
-        key = geocode_key(r.get("city"), r.get("postal_code"))
-        cached = cache.get(key)
+        loc = (r.get("location_text") or "").strip()
+        cached = cache.get(geocode_key(loc)) if loc else None
         if cached:
             r["_lat"], r["_lon"] = cached[0], cached[1]
         else:
             unresolved += 1
 
     if unresolved:
-        print(f"[warn] {unresolved} offres sans coordonnées exploitables (géocodage échoué ou ville/CP manquants) — elles seront exclues de la carte.")
+        print(f"[warn] {unresolved} offres sans coordonnées exploitables (géocodage échoué, en attente du prochain run, ou localisation manquante) — elles seront exclues de la carte pour l'instant.")
 
     return records
 
@@ -320,17 +382,26 @@ def parse_date_safe(value: str | None):
     return None
 
 
-def build_records(df: pd.DataFrame, mapping: dict[str, str]) -> list[dict]:
+def build_records(df: pd.DataFrame, mapping: dict[str, str], location_columns: list[str]) -> list[dict]:
     records = []
-    for _, row in df.iterrows():
+    for row in df.to_dict(orient="records"):
         rec = {}
         for logical, col in mapping.items():
             val = row.get(col)
-            if pd.isna(val):
+            if val is None or (isinstance(val, float) and pd.isna(val)):
                 val = None
             elif isinstance(val, str):
-                val = val.strip()
+                val = val.strip() or None
             rec[logical] = val
+
+        location_text = None
+        for col in location_columns:
+            val = row.get(col)
+            if isinstance(val, str) and val.strip():
+                location_text = val.strip()
+                break
+        rec["location_text"] = location_text
+
         records.append(rec)
     return records
 
@@ -351,16 +422,29 @@ def filter_expired(records: list[dict]) -> list[dict]:
     return kept
 
 
+def build_fallback_search_url(title: str | None, employer: str | None) -> str:
+    """Faute de colonne URL dans le jeu de données, construit un lien de
+    recherche vers le site officiel plutôt qu'un lien direct potentiellement
+    faux. Clairement labellisé "Rechercher" côté frontend, pas "Voir l'offre"."""
+    parts = [p for p in [title, employer] if p]
+    query = " ".join(parts) or "offre"
+    q = f'site:choisirleservicepublic.gouv.fr "{query}"'
+    return "https://www.google.com/search?q=" + urllib.parse.quote(q)
+
+
 def finalize_records(records: list[dict]) -> list[dict]:
     out = []
     for i, r in enumerate(records):
         if r.get("_lat") is None or r.get("_lon") is None:
             continue
+        title = r.get("title") or "Offre sans titre"
+        employer = r.get("employer")
+        url = r.get("url") or build_fallback_search_url(title, employer)
         out.append({
             "id": r.get("id") or f"offre-{i}",
-            "titre": r.get("title") or "Offre sans titre",
-            "employeur": r.get("employer"),
-            "ville": r.get("city"),
+            "titre": title,
+            "employeur": employer,
+            "ville": r.get("city") or r.get("location_text"),
             "code_postal": r.get("postal_code"),
             "departement": r.get("department"),
             "region": r.get("region"),
@@ -369,7 +453,8 @@ def finalize_records(records: list[dict]) -> list[dict]:
             "versant": r.get("versant"),
             "date_publication": r.get("publish_date"),
             "date_limite": r.get("closing_date"),
-            "url": r.get("url"),
+            "url": url,
+            "url_est_directe": bool(r.get("url")),
             "lat": round(r["_lat"], 5),
             "lon": round(r["_lon"], 5),
         })
@@ -382,8 +467,8 @@ def main() -> int:
     try:
         csv_url, resource_title = find_dataset_csv_url()
         df = download_csv(csv_url)
-        mapping = map_columns(df)
-        records = build_records(df, mapping)
+        mapping, location_columns = map_columns(df)
+        records = build_records(df, mapping, location_columns)
         records = filter_expired(records)
         records = enrich_with_coordinates(records, mapping)
         final_records = finalize_records(records)

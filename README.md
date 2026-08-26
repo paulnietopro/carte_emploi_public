@@ -27,6 +27,19 @@ uniquement les données ouvertes publiées sous Licence Ouverte 2.0.
 Aucune clé d'API n'est nécessaire (data.gouv.fr et la Base Adresse Nationale
 sont en accès libre).
 
+### Particularité constatée du CSV (2026)
+
+Le CSV réellement publié ne contient ni colonne "URL de l'offre" ni colonnes
+ville/code postal séparées. Le script déduit donc la localisation d'un champ
+texte libre (`Lieu d'affectation`, avec repli sur `Lieu d'affectation (sans
+géolocalisation)` puis `Localisation du poste`) qu'il géocode via l'API
+Adresse. Faute d'URL directe dans les données, chaque offre est accompagnée
+d'un lien de **recherche** vers le site officiel (`site:choisirleservicepublic.gouv.fr`
+sur Google) plutôt que d'un lien direct potentiellement erroné — le lien est
+étiqueté différemment dans l'interface selon les cas ("Voir l'offre" si une
+vraie URL existe un jour dans le jeu de données, "Rechercher cette offre"
+sinon).
+
 ## Mise en ligne (une seule fois)
 
 1. Crée un nouveau dépôt GitHub (public, sinon GitHub Pages gratuit n'est pas

@@ -1,5 +1,7 @@
 """Test local (non commité) : valide la logique de update_data.py avec des
-données synthétiques, sans appeler data.gouv.fr ni l'API BAN."""
+données synthétiques reproduisant le VRAI format de colonnes du CSV constaté
+le 2026-08-26 (30 colonnes, sans URL ni ville/code postal séparés — voir le
+commentaire en tête de update_data.py). Ne fait aucun appel réseau."""
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
@@ -7,53 +9,70 @@ sys.path.insert(0, str(Path(__file__).parent))
 import pandas as pd
 import update_data as ud
 
-# --- Simule un CSV avec des noms de colonnes plausibles (variante 1) ---
+# --- Reproduit les vraies colonnes du CSV (sous-ensemble pertinent) ---
 df = pd.DataFrame([
     {
-        "Id_offre": "1", "Intitule_du_poste": "Développeur back-end",
-        "Nom_employeur": "Ministère du Numérique", "Ville": "Paris",
-        "Code_postal_lieu_travail": "75001", "Departement_lieu_travail": "75",
-        "Region_lieu_travail": "Ile-de-France", "Domaine_metier": "Numérique",
-        "Nature_contrat": "CDD", "Date_publication": "2026-08-01",
-        "Date_limite_candidature": "2099-01-01", "Url_offre": "https://example.gouv.fr/1",
+        "Référence": "REF-1", "Intitulé du poste": "Développeur back-end",
+        "Employeur": "Ministère du Numérique", "Organisme de rattachement": "État",
+        "Versant": "FPE", "Métier": "Numérique", "Nature de contrat": "CDD",
+        "Durée du contrat": "12 mois",
+        "Lieu d'affectation": "20 Avenue de Ségur, 75007 Paris",
+        "Lieu d'affectation (sans géolocalisation)": "Paris",
+        "Localisation du poste": "Île-de-France",
+        "Date de première publication": "2026-08-01",
+        "Date de fin de publication par défaut": "2099-01-01",
     },
     {
-        "Id_offre": "2", "Intitule_du_poste": "Infirmier", "Nom_employeur": "CHU Lyon",
-        "Ville": "Lyon", "Code_postal_lieu_travail": "69003", "Departement_lieu_travail": "69",
-        "Region_lieu_travail": "Auvergne-Rhone-Alpes", "Domaine_metier": "Santé",
-        "Nature_contrat": "Titulaire", "Date_publication": "2026-08-10",
-        "Date_limite_candidature": "2020-01-01",  # expirée -> doit être filtrée
-        "Url_offre": "https://example.gouv.fr/2",
+        "Référence": "REF-2", "Intitulé du poste": "Infirmier",
+        "Employeur": "CHU Lyon", "Organisme de rattachement": "Hospitalière",
+        "Versant": "FPH", "Métier": "Santé", "Nature de contrat": "Titulaire",
+        "Durée du contrat": "",
+        "Lieu d'affectation": "", "Lieu d'affectation (sans géolocalisation)": "Lyon",
+        "Localisation du poste": "Auvergne-Rhône-Alpes",
+        "Date de première publication": "2026-08-10",
+        "Date de fin de publication par défaut": "2020-01-01",  # expirée -> filtrée
     },
     {
-        "Id_offre": "3", "Intitule_du_poste": "Chef de projet SI", "Nom_employeur": "Conseil régional",
-        "Ville": "Marseille", "Code_postal_lieu_travail": "13001", "Departement_lieu_travail": "13",
-        "Region_lieu_travail": "PACA", "Domaine_metier": "Numérique",
-        "Nature_contrat": "CDI", "Date_publication": "2026-08-15",
-        "Date_limite_candidature": "2099-01-01", "Url_offre": "https://example.gouv.fr/3",
-        "Latitude": "43.2965", "Longitude": "5.3698",
+        "Référence": "REF-3", "Intitulé du poste": "Chef de projet SI",
+        "Employeur": "Conseil régional PACA", "Organisme de rattachement": "Territoriale",
+        "Versant": "FPT", "Métier": "Numérique", "Nature de contrat": "CDI",
+        "Durée du contrat": "",
+        "Lieu d'affectation": "", "Lieu d'affectation (sans géolocalisation)": "",
+        "Localisation du poste": "Marseille",
+        "Date de première publication": "2026-08-15",
+        "Date de fin de publication par défaut": "2099-01-01",
     },
 ])
 
-mapping = ud.map_columns(df)
-assert mapping["title"] == "Intitule_du_poste", mapping
-assert mapping["url"] == "Url_offre", mapping
-assert mapping["lat"] == "Latitude" and mapping["lon"] == "Longitude", mapping
-print("OK map_columns")
+mapping, location_columns = ud.map_columns(df)
+assert mapping["title"] == "Intitulé du poste", mapping
+assert mapping["employer"] == "Employeur", mapping
+assert mapping["domain"] == "Métier", mapping
+assert mapping["contract_type"] == "Nature de contrat", f"attendu 'Nature de contrat', obtenu {mapping.get('contract_type')}"
+assert mapping["publish_date"] == "Date de première publication", mapping
+assert mapping["closing_date"] == "Date de fin de publication par défaut", mapping
+assert "url" not in mapping, "pas de colonne URL dans ce jeu de données réel"
+assert location_columns == ["Lieu d'affectation", "Lieu d'affectation (sans géolocalisation)", "Localisation du poste"], location_columns
+print("OK map_columns (vrai schéma 2026)")
 
-records = ud.build_records(df, mapping)
-assert len(records) == 3
+records = ud.build_records(df, mapping, location_columns)
+assert records[0]["location_text"] == "20 Avenue de Ségur, 75007 Paris"  # priorité 1
+assert records[1]["location_text"] == "Lyon"  # priorité 2 (priorité 1 vide)
+assert records[2]["location_text"] == "Marseille"  # priorité 3 (1 et 2 vides)
+print("OK build_records : priorité des colonnes de localisation respectée")
+
 records = ud.filter_expired(records)
 assert len(records) == 2, f"attendu 2 offres non expirées, obtenu {len(records)}"
 print("OK filter_expired (offre expirée exclue)")
 
 # monkeypatch le géocodage réseau pour le test
-def fake_geocode_ban(city, postal_code):
-    fake_coords = {
-        "paris": (48.8566, 2.3522),
-        "lyon": (45.7640, 4.8357),
-    }
-    return fake_coords.get((city or "").strip().lower())
+def fake_geocode_ban(location_text):
+    fake_coords = {"paris": (48.8566, 2.3522), "marseille": (43.2965, 5.3698)}
+    text = location_text.strip().lower()
+    for key, coords in fake_coords.items():
+        if key in text:
+            return coords
+    return None
 
 ud.geocode_ban = fake_geocode_ban
 ud.GEOCODE_CACHE_PATH = Path("/tmp/geocode_cache_test.json")
@@ -64,20 +83,13 @@ enriched = ud.enrich_with_coordinates(records, mapping)
 final = ud.finalize_records(enriched)
 assert len(final) == 2, final
 by_id = {r["id"]: r for r in final}
-assert abs(by_id["1"]["lat"] - 48.8566) < 0.01, "Paris devrait être géocodé via BAN (mock)"
-assert abs(by_id["3"]["lat"] - 43.2965) < 0.001, "Marseille devrait utiliser les coordonnées directes du CSV"
-print("OK enrich_with_coordinates + finalize_records")
 
-# --- Vérifie la robustesse du mapping avec des noms de colonnes différents (variante 2) ---
-df2 = pd.DataFrame([
-    {"reference": "9", "titre": "Juriste", "employeur": "Prefecture", "commune": "Nantes",
-     "cp": "44000", "url": "https://example.gouv.fr/9", "type_contrat": "CDD",
-     "date_creation": "2026-08-01", "date_cloture": "2099-01-01"},
-])
-mapping2 = ud.map_columns(df2)
-assert mapping2["title"] == "titre"
-assert mapping2["city"] == "commune"
-assert mapping2["postal_code"] == "cp"
-print("OK map_columns variante 2 (noms de colonnes alternatifs)")
+# REF-1 a une adresse complète dans "Lieu d'affectation" -> geocodée via le mock "paris"
+assert abs(by_id["REF-1"]["lat"] - 48.8566) < 0.01, by_id["REF-1"]
+# Pas de colonne URL -> lien de recherche construit, et marqué comme non direct
+assert by_id["REF-1"]["url_est_directe"] is False
+assert "google.com/search" in by_id["REF-1"]["url"]
+assert "Développeur" in by_id["REF-1"]["url"] or "back-end" in by_id["REF-1"]["url"]
+print("OK enrich_with_coordinates + finalize_records + lien de recherche fallback")
 
-print("\nTous les tests locaux ont réussi.")
+print("\nTous les tests locaux ont réussi (schéma réel du 2026-08-26).")

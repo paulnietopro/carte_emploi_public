@@ -282,7 +282,10 @@ function buildPopupHtml(o) {
   if (o.employeur) parts.push(`<div class="popup-employer">${escapeHtml(o.employeur)}</div>`);
   if (o.ville) parts.push(`<div>${escapeHtml(o.ville)}${o.code_postal ? " (" + o.code_postal + ")" : ""}</div>`);
   if (o.contrat) parts.push(`<div>${escapeHtml(o.contrat)}</div>`);
-  if (o.url) parts.push(`<a class="popup-link" href="${escapeAttr(o.url)}" target="_blank" rel="noopener">Voir l'offre &rarr;</a>`);
+  if (o.url) {
+    const label = o.url_est_directe ? "Voir l'offre" : "Rechercher cette offre sur le site officiel";
+    parts.push(`<a class="popup-link" href="${escapeAttr(o.url)}" target="_blank" rel="noopener">${label} &rarr;</a>`);
+  }
   return parts.join("");
 }
 
